@@ -1,0 +1,521 @@
+---
+title: "Blog 3 - Quarto Simulation"
+author: "Michael Ippolito"
+date: '2022-11-24'
+output: 
+  html_document:
+    theme: yeti
+    highlight: tango
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    dev: cairo_pdf
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(fitdistrplus)
+
+```
+
+## Background
+
+Quarto is a two-player strategy game akin to chess, but not as complicated, well known, or widely played. It is played on a four-by-four tiled board with sixteen pawns having different sizes and shapes. The object of the game is to beat your opponent by getting four matching pawns in a row, either horizontally, vertically, or diagonally.
+
+Each pawn has characteristics from each of four categories:
+
+1. Round or square
+2. Solid or hollow
+3. Tall or short
+4. Dark or light
+
+For example, the first pawn is round, solid, tall, dark (and handsome?). The second pawn is round, solid, tall, and light. And so on.
+
+The more I played the game, the more I wondered if there is an advantage to going first versus second, and how often the game ends in a win for one player as opposed to the game ending in a draw (i.e. when no four pawns match in any direction). I got the idea to data-science the problem to figure out the answers. Concretely, my objectives were:
+
+1. Find out if there is an advantage to going first versus second.
+2. Find the number of times the game ends in a win versus a draw.
+3. Find the number of moves needed to win.
+4. See if this number follows a particular distribution and statistically evaluate goodness of fit for that distribution.
+
+I'll make some assumptions for this analysis, namely:
+
+1. Since the computer (rather than a human) will be selecting the game pieces to play and where to play them, I'll assume that the players are evenly matched.
+2. The players are allowed to make mistakes. I.e., if a player places a pawn in a position where the other player can easily win, there are no backsies; the second player will be allowed to win. In a friendly game between two humans, this assumption wouldn't hold, but it makes the logic for this analysis more straightforward.
+3. Since the players are evenly matched and are allowed to make mistakes, I'll assume that there should be no prior strategy by either player and, therefore, a randomly played game is just as likely to produce a victory as one played more strategically.
+
+
+```{r include=FALSE}
+
+# Functions
+
+ret_pawn_list <- function() {
+    for (i in seq(1, 16)) {
+        print(paste(i, ret_pawn_txt(i)))
+    }
+}
+
+# Ret pawn type
+ret_pawn_type <- function(t) {
+    if (t == 1) {
+        return('fill')
+    } else if (t == 2) {
+        return ('shape')
+    } else if (t == 3) {
+        return ('color')
+    } else if (t == 4) {
+        return ('size')
+    } else {
+        return ('unhandled')
+    }
+}
+
+# Return pawn array at pawn #
+ret_pawn_arr <- function(i) {
+  if (i == 0) {
+    return(rep(NA, 4))
+  } else {
+    i_fill <- pawns[[i]][[1]]
+    i_shape <- pawns[[i]][[2]]
+    i_color <- pawns[[i]][[3]]
+    i_size <- pawns[[i]][[4]]
+    i_inplay <- pawns[[i]][[5]]
+    return(c(i_fill, i_shape, i_color, i_size, i_inplay))
+  }
+}
+
+# Return pawn text at pawn #
+ret_pawn_txt <- function(i) {
+  if (i == 0) {
+    return(NA)
+  } else {
+    i_fill <- pawn_fill[pawns[[i]][[1]]]
+    i_shape <- pawn_shape[pawns[[i]][[2]]]
+    i_color <- pawn_color[pawns[[i]][[3]]]
+    i_size <- pawn_size[pawns[[i]][[4]]]
+    i_inplay <- pawn_inplay[pawns[[i]][[5]]]
+    return(paste(i_fill, i_shape, i_color, i_size, i_inplay))
+  }
+}
+
+# Print game board
+ret_board <- function(board) {
+  ret <- matrix(nrow=4, ncol=4, 0)
+  for (i in seq(1, 4)) {
+    for (j in seq(1, 4)) {
+      ret[i, j] = ret_pawn_txt(board[i, j])
+    }
+  }
+  return(ret)
+}
+
+# Init squares on the game board - a square is a vector, and all it contains is (row, col)
+init_squares <- function() {
+    sqr <- vector(mode='list', length=16)
+    k <- 0
+    for (i in seq(1, 4)) {
+      for (j in seq(1, 4)) {
+        k <- k + 1
+        sqr[[k]] <- c(i, j, 1)  # row, col, occupied(1=vacant, 2=occupied)
+      }
+    }
+    return(sqr)
+}
+
+# Clear game board
+clear_board <- function() {
+  board <- matrix(nrow=4, ncol=4, data=0)
+  return(board)
+}
+
+init_pawns <- function() {
+
+    # Init pawn type vectors
+    pawns <<- vector(mode='list', length=16)
+    pawn_fill <<- c('solid', 'hollow')
+    pawn_color <<- c('dark', 'light')
+    pawn_shape <<- c('square', 'round')
+    pawn_size <<- c('short', 'tall')
+    pawn_inplay <<- c('avail', 'played')
+    
+    # Populate pawns
+    i <- 0
+    for (i_fill in seq(1, 2)) {
+      for (i_color in seq(1, 2)) {
+        for (i_shape in seq(1, 2)) {
+          for (i_size in seq(1, 2)) {
+            i <- i + 1
+            pawns[[i]] <- c(i_fill, i_color, i_shape, i_size, 1)  # last component indicates if pawn is in play (1=avail)
+          }
+        }
+      }
+    }
+    return(pawns)
+    
+}
+
+# See if the game board is in a "won" state
+is_won <- function(board) {
+
+    # Check for victory condition
+    for (d in seq(3, 4)) {  # d=1 rows, d=2 columns, d=3 down to the left, d=4 down to the right
+        if (debugmode == T) {
+            if (d == 1) {
+                print('checking rows')
+            } else if (d == 2) {
+                print('checking columns')
+            } else if (d == 3) {
+                print('checking diagonal down and to the left')
+            } else if (d == 4) {
+                print('checking diagonal down and to the right')
+            }
+        }
+        for (i in seq(1, 4)) {  # number of type of pawns (dark/lt, round/square, etc)
+            for (j in seq(1, 2)) {  # values within each type (dark vs lt, etc)
+                if (debugmode == T) {
+                    print(paste0('    checking type ', ret_pawn_type(i), ', value ', j))
+                }
+                for (m in seq(1, 4)) {
+                    if (debugmode == T) {
+                        print(paste0('        checking row/column ', m))
+                    }
+                    num_same = 0
+                    for (n in seq(1, 4)) {
+                        p <- board[m, n]  # pawn id at row m, col n, assum d=1 (rows) for now
+                        if (d == 2) {
+                            p <- board[n, m]  # pawn id at row n, col m
+                        } else if (d == 3) {
+                            p <- board[n, n]  # pawn id at col n, row n
+                        } else if (d == 4) {
+                            p <- board[n, 5 - n]  # pawn id at col m, row n
+                        }
+                        if (debugmode == T) {
+                            print(paste0('            ', ret_pawn_txt(p)))
+                        }
+                        if (p != 0) {  # make sure space isn't empty
+                            if (pawns[[p]][[i]] == j) {
+                                num_same <- num_same + 1
+                            }
+                        }
+                    }
+                }
+                if (num_same == 4) {
+                    if (debugmode == T) {
+                        print(paste('returning true for (d, i, j, m, n) =', d, i, j, m, n))
+                    }
+                    return(T)
+                }
+                if (d > 2) {  # there is only one diagonal in each direction, so don't need to iterate 4 times
+                    break
+                }
+            }
+        }
+    }
+    return(F)
+}
+
+# Randomly populate board with a given number of pawns
+random_board <- function(board, num_pawns) {
+    s <- sample(sqr, num_pawns, replace=F)  # the list of squares in random order
+    p <- sample(16, num_pawns, replace=F)  # the list of pawns in random order
+    print(p)
+    for (i in seq(1, num_pawns)) {
+      i_row <- s[[i]][[1]]
+      i_col <- s[[i]][[2]]
+      i_pawn <- board[i_row, i_col]
+      board[i_row, i_col] <- p[i]
+      pawn_num <- p[i]
+      pawns[[pawn_num]][[5]] <<- 2  # mark pawn as played
+    }
+    return(board)
+}
+
+# Play a pawn at random from all the remaining pawns not yet in play
+play_random_pawn <- function() {
+    is_pawn_avail <- (sapply(pawns, '[[', 5) == 1)  # true-false list of available pawns
+    sel_pawn <- sample(pawns[is_pawn_avail], 1, replace=F) # select one available pawn at random
+    i_sel_pawn <- which(match(pawns, sel_pawn) == 1)  # index of the selected pawn
+    pawns[[i_sel_pawn]][[5]] <<- 2  # mark pawn as played
+    is_sqr_avail <- (sapply(sqr, '[[', 3) == 1)  # true-false list of unoccupied squares
+    sel_sqr <- sample(sqr[is_sqr_avail], 1, replace=F) # select one vacant square at random
+    i_sel_sqr <- which(match(sqr, sel_sqr) == 1) # index of the selected square
+    sqr[[i_sel_sqr]][[3]] <<- 2 # mark square as played
+    i_row <- sqr[[i_sel_sqr]][[1]]
+    i_col <- sqr[[i_sel_sqr]][[2]]
+    board[i_row, i_col] <- i_sel_pawn
+    return(board)
+}
+
+```
+
+
+## Initialize Game
+
+First, I'll initialize the game board by defining each pawn and setting up a blank set of squares.
+
+```{r echo=FALSE}
+
+# Debug mode
+debugmode = F
+
+# Init game board
+board <- matrix()
+sqr <- init_squares()
+board <- clear_board()
+pawns <- init_pawns()
+
+# Print list of pawns
+print('Pawns:')
+for (i in seq(1, 16)) {
+  print(paste(i, ret_pawn_txt(i)))
+}
+print('')
+
+```
+
+A number of functions will be needed, for example:
+
+function | purpose
+---------|--------
+clear_board | Empties the board of pawns
+play_random_pawn | Plays a randomly selected pawn onto a randomly selected square of the game board
+is_won | Evaluates the game board to determine whether there is a set of four pawns in a row in any direction
+
+
+## Game Play
+
+Now for the actual game play, of which I'll iteratively run 1,000 times. For each game, a randomly selected pawn will be placed on a randomly selected empty square of the game board. After each pawn is played, the game board will be evaluated for whether one of the players has won or not. If the number of moves up until that point is odd, that indicates the player who went first won; conversely, if the number of moves is even, the second player is the winner.
+
+```{r}
+
+# Iteratively play random games, talying the number of times the game is won and
+# the number of wins by the first and second players
+num_reps <- 1000  # the number of repetitions to perform
+won_games <- c()  # the total number of games won
+move_num <- c()  # the number of moves needed to win the game
+set.seed(8)
+
+# Iterate through reps
+for (j in seq(1, num_reps)) {
+    
+    # Initialize game
+    sqr <- init_squares()  # initialize game squares
+    board <- clear_board()  # clear the game board
+    pawns <- init_pawns()  # initialize the game pawns
+    
+    # Iterate through each square on the board
+    for (i in seq(1, 16)) {
+        board <- play_random_pawn()  # get index of pawn played
+        game_is_won = F
+        # Impossible for the game to be won unless there are at least 4 pawns on the board
+        if (i > 3) {
+            game_is_won <- is_won(board)  # see if board is won
+        }
+        if (game_is_won | i == 16) {
+            # Add the number of won games to the tally
+            won_games <- c(won_games, game_is_won)
+            if (game_is_won) {
+                # Add the number of moves required to win
+                move_num <- c(move_num, i)
+            } else {
+                # If the game is a drawn, indicate this by setting move_num to zero
+                move_num <- c(move_num, 0)
+            }
+            break
+        }
+    }
+}
+
+```
+
+
+## Results
+
+Now let's look at the results of the simulation.
+
+```{r echo=FALSE}
+
+# Summary of games won
+print('First 10 won games:')
+print(won_games[1:10])
+print('')
+print('First 10 number of moves:')
+print(move_num[1:10])
+print('')
+print(paste0('won ', sum(won_games), ' of ', num_reps, ' (', round(sum(won_games) / num_reps, 3), ')'))
+
+# Who won the most - first player or second player
+fun <- function(x) { return(ifelse(x == 0, 0, (x %% 2) + 1)) }
+odd_even <- sapply(move_num, fun)
+num_odd <- sum(odd_even == 1)
+num_even <- sum(odd_even == 2)
+total_won <- sum(won_games)
+print(paste0('First player won: ', num_odd, ' of ', total_won, ' (', round(num_odd / total_won, 3), ')'))
+print(paste0('Second player won: ', num_even, ' of ', total_won, ' (', round(num_even / total_won, 3), ')'))
+print(paste0('Average number of moves to win (when the game is won): ', round(mean(move_num[move_num > 0]), 1)))
+print(paste0('Median number of moves to win (when the game is won): ', median(move_num[move_num > 0])))
+
+# Plot number of wins vs number of ties
+barplot(c(Wins=length(won_games[won_games == T]), Ties=length(won_games[won_games == F])), main='Number of Wins and Ties')
+
+# Which player wins the most
+barplot(c(Player1=num_odd, Player2=num_even), main='Which Player Wins the Most')
+
+# Plot number of moves to win
+hist(move_num[move_num > 0], xlab='Number of moves', main='Number of Moves Needed to Win')
+plot(density(move_num[move_num > 0]), xlab='Number of moves', main='Number of Moves Needed to Win')
+
+```
+
+As shown, only a little more than a quarter (28.8%) of the games result in a win rather than a draw. And the first player has a clear advantage over the second, winning almost 8% more games. When the game results in a win, it takes an average of 13.6 moves to win it, with a median of 14.
+
+
+## Distribution
+
+Now we'll try to fit a distribution to the data. To do this, we'll first create a frequency table. Then we'll use the function "descdist" from the fitdistrplus package to look for a suitable distribution.
+
+```{r include=FALSE}
+
+# Create frequency table
+df <- data.frame(table(move_num[move_num > 0]))
+colnames(df) <- c('Moves', 'Freq')
+df$Moves <- as.numeric(as.character((df$Moves)))
+df$p <- df$Freq / sum(df$Freq)
+mean_p <- sum(df$p * df$Freq) / sum(df$Freq)
+
+```
+
+```{r}
+
+# Find distribution
+descdist(move_num[move_num > 0], discrete=F)
+
+```
+
+Based on the graph, a beta distribution seems like a good fit. The beta distribution takes two parameters: shape1 and shape2. We'll try to find these parameters by using the "fitdist" function from the same package.
+
+```{r}
+
+# Fit beta distribution
+(fd <- fitdist(df$p, 'beta'))
+
+```
+
+Now we'll generate a beta sequence using the rbeta function so we can compare it to the sequence generated by the simulation.
+
+```{r include=FALSE}
+
+# Create dummy table of zeros so all values from 1 to 16 are represented, merge with existing table
+dftmp <- data.frame(Moves=seq(1, 16), Freq=0)
+df <- df %>%
+    merge(dftmp, all=T, by='Moves') %>%
+    replace(is.na(.), 0) %>%
+    group_by(Moves, p) %>%
+    summarize(Freq = Freq.x + Freq.y, .groups='keep')
+
+```
+
+```{r}
+
+# Generate a sequence following the beta distribution using the specified estimates
+beta_dist <- rbeta(n=total_won, shape1=fd$estimate[2], shape2=fd$estimate[1])
+beta_dist <- beta_dist * 16
+hist(beta_dist)
+
+```
+
+```{r include=FALSE}
+
+# Create frequency table for beta distribution
+dfbeta <- data.frame(table(as.integer(beta_dist)))
+colnames(dfbeta) <- c('Moves', 'Freq')
+dfbeta$Moves <- as.numeric(as.character((dfbeta$Moves)))
+
+# Create dummy table of zeros so all values from 1 to 16 are represented, merge with existing table
+dfbeta <- dftmp %>%
+    merge(dfbeta, all=T) %>%
+    group_by(Moves) %>%
+    summarize(Freq = sum(Freq))
+dfbeta$p <- dfbeta$Freq / sum(dfbeta$Freq)
+
+```
+
+Overlaying the density plots of the two distributions, we see that it's not a bad match.
+
+```{r}
+
+# Overlay plots
+plot(density(move_num[move_num > 0]), 
+     main='Simulation (in black) overlain by beta distribution (in red)', 
+     xlab='', ylab='', xaxt='n', yaxt='n', xlim=c(4, 16), ylim=c(0, 0.5))
+par(new=T)
+plot(density(beta_dist), main='', col=2, 
+     xlab='Moves', ylab='Density', xlim=c(4, 16), ylim=c(0, 0.5))
+
+```
+
+Now we'll make the same comparison using a binomial distribution.
+
+```{r}
+
+# Generate a sequence following the binomial distribution using the specified estimates
+binom_dist <- rbinom(n=total_won,size=12,prob=1-mean_p)
+binom_dist <- binom_dist + 4
+hist(binom_dist)
+
+```
+
+```{r include=FALSE}
+
+# Create frequency table for binomial distribution
+dfbinom <- data.frame(table(as.integer(binom_dist)))
+colnames(dfbinom) <- c('Moves', 'Freq')
+dfbinom$Moves <- as.numeric(as.character((dfbinom$Moves)))
+
+# Create dummy table of zeros so all values from 1 to 16 are represented, merge with existing table
+dfbinom <- dftmp %>%
+    merge(dfbinom, all=T) %>%
+    group_by(Moves) %>%
+    summarize(Freq = sum(Freq))
+dfbinom$p <- dfbinom$Freq / sum(dfbinom$Freq)
+
+```
+
+Again, we'll overlay the plots to see how well they match.
+
+```{r}
+
+# Overlay plots
+plot(density(move_num[move_num > 0]), 
+     main='Simulation (in black) overlain by binomial distribution (in red)', 
+     xlab='', ylab='', xaxt='n', yaxt='n', xlim=c(4, 16), ylim=c(0, 0.5))
+par(new=T)
+plot(density(binom_dist), main='', col=2, 
+     xlab='Moves', ylab='Density', xlim=c(4, 16), ylim=c(0, 0.5))
+
+```
+
+To quantitatively evaluate how well the two distributions fit the data, we'll perform chi-squared tests.
+
+```{r}
+
+# Chi-squared test comparing distributions
+chisq.test(x=df$Moves, y=dfbeta$Moves)
+chisq.test(x=df$Moves, y=dfbinom$Moves)
+
+```
+
+
+## Conclusions
+
+As shown, the beta and binomial distributions form a relatively good fit to the distribution of wins geneated by the random game simulations. This is confirmed by chi-squared tests, which yielded p-values above 0.05. In addition, the objectives were met with the following conclusions:
+
+1. There is a clear advantage to going first versus second, with the first player winning 57.6% of the time.
+2. The number of times the game ends in a win versus a draw is roughly 28.8% of games.
+3. On average, it takes 13.6 moves to win a game (when the game doesn't end in a draw), with a median of 14.
+4. The distribution of won games roughly follows the beta and binomial distributions with statistical evidence to support the fit.
+
+
